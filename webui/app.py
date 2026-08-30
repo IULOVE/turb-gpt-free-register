@@ -3,7 +3,7 @@
 Flask 本地控制台。
 
 复用现有后端：
-    core.db                     —— 账号 / 邮箱池 / 任务的文件持久化与查询
+    core.db                     —— 账号 / 邮箱池 / 任务的 SQLite 持久化与查询
     core.registration_service   —— 线程池批量注册 + 任务日志
     webui.config_editor         —— 安全读写 config/*.py
 
@@ -11,12 +11,15 @@ Flask 本地控制台。
 默认绑定 127.0.0.1，仅本地访问。
 """
 import logging
+import gzip
+import json
 import threading
 import time
 import uuid
 from urllib.parse import urlparse
 
 from flask import Flask, Response, jsonify, make_response, render_template, request
+import pyotp
 
 from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
 from webui.auth import init_auth, register_auth_routes
@@ -88,11 +91,29 @@ def _compact_account_for_list(row: dict) -> dict:
         "codex_agent_has_token": bool(str(row.get("codex_agent_token") or "").strip()),
     }
 
+    extra_raw = row.get("extra_json")
+    extra = {}
+    if isinstance(extra_raw, str) and extra_raw.strip():
+        try:
+            extra = json.loads(extra_raw)
+        except Exception:
+            extra = {}
+    elif isinstance(extra_raw, dict):
+        extra = extra_raw
+    password = str(
+        extra.get("registration_password")
+        or row.get("registration_password")
+        or ""
+    ).strip()
+    if password:
+        out["password"] = password
+
     # 这些是列表固定列直接展示字段。
     for key in (
         "user_name", "email_source", "note", "archived", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
         "plan_check_status", "codex_status", "codex_agent_status",
+        "totp_setup_status",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -109,7 +130,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "token_expired", "token_expires_at",
         # 查活状态。
         "live_check_status", "live_check_error", "live_checked_at",
-        "live_check_device_id", "live_check_proxy_used", "live_check_fingerprint_text",
+        "live_check_proxy_used", "live_check_fingerprint_text",
         # 提链成功/失败时才需要。
         "extract_link_status", "extract_link_type", "extract_link_message", "extract_link_error",
         "extract_link_long_url", "extract_link_copy_paste", "extract_link_image_url_png",
@@ -117,6 +138,7 @@ def _compact_account_for_list(row: dict) -> dict:
         # Codex / Agent 状态提示。
         "codex_error", "codex_agent_message", "codex_agent_runtime_id",
         "codex_agent_sub2api_url", "codex_agent_sub2api_mode", "codex_agent_sub2api_total",
+        "totp_setup_error", "totp_setup_message", "totp_setup_started_at", "totp_setup_completed_at",
     )
     for key in optional_keys:
         value = row.get(key)
@@ -135,10 +157,31 @@ def _account_secret_value(row: dict, field: str) -> str:
     if field == "access_token":
         return str(row.get("access_token") or "")
     if field == "copy_line":
-        return str(row.get("copy_line") or "")
+        try:
+            from core.db import _account_line
+
+            return str(_account_line(row) or "")
+        except Exception:
+            return str(row.get("copy_line") or "")
     if field == "codex_agent_token":
         return str(row.get("codex_agent_token") or "")
-    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token")
+    if field == "totp_secret":
+        return str(row.get("totp_secret") or "")
+    if field == "totp_code":
+        secret = str(row.get("totp_secret") or "").strip()
+        return pyotp.TOTP(secret).now() if secret else ""
+    if field == "password":
+        extra_raw = row.get("extra_json")
+        extra = {}
+        if isinstance(extra_raw, str) and extra_raw.strip():
+            try:
+                extra = json.loads(extra_raw)
+            except Exception:
+                extra = {}
+        elif isinstance(extra_raw, dict):
+            extra = extra_raw
+        return str(extra.get("registration_password") or row.get("registration_password") or "未设置")
+    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token/totp_secret/totp_code/password")
 
 
 def _compact_job_for_list(row: dict) -> dict:
@@ -170,9 +213,55 @@ def _job_status_counts(rows: list[dict]) -> dict:
     counts["active"] = sum(int(counts.get(s, 0) or 0) for s in ("pending", "running", "stopping"))
     return counts
 
+
+def _read_log_tail(path, *, max_bytes: int, default_running: bool = False, running_fn=None) -> dict:
+    if not path.exists():
+        return {"ok": True, "log": "", "running": bool(default_running)}
+    size = path.stat().st_size
+    with path.open("rb") as f:
+        if size > max_bytes:
+            f.seek(size - max_bytes)
+        content = f.read().decode("utf-8", errors="replace")
+    running = bool(default_running)
+    if callable(running_fn):
+        try:
+            running = bool(running_fn())
+        except Exception:
+            pass
+    return {"ok": True, "log": content, "running": running}
+
 def create_app(auth_code: str | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates")
     _prepared_downloads: dict[str, dict] = {}
+
+    @app.after_request
+    def _compress_json_response(response: Response):
+        """默认对 JSON API 响应启用 gzip，减少本地前端拉取大列表的传输体积。"""
+        accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
+        # 默认开启 gzip：浏览器会自动带 gzip；本地脚本未带 Accept-Encoding 时也压缩。
+        # 只有客户端明确声明 identity 且没有 gzip 时，才按明文返回。
+        gzip_allowed = ("gzip" in accept_encoding) or (not accept_encoding)
+        if (
+            response.direct_passthrough
+            or response.headers.get("Content-Encoding")
+            or not gzip_allowed
+        ):
+            return response
+        mimetype = (response.mimetype or "").lower()
+        if mimetype != "application/json":
+            return response
+        data = response.get_data()
+        if not data or len(data) < 1024:
+            return response
+        compressed = gzip.compress(data, compresslevel=6)
+        if len(compressed) >= len(data):
+            return response
+        response.set_data(compressed)
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["Content-Length"] = str(len(compressed))
+        vary = response.headers.get("Vary")
+        response.headers["Vary"] = "Accept-Encoding" if not vary else f"{vary}, Accept-Encoding"
+        return response
 
     def _put_prepared_download(content: bytes, filename: str, mimetype: str = "application/zip") -> str:
         now = time.time()
@@ -224,6 +313,9 @@ def create_app(auth_code: str | None = None) -> Flask:
     recovered_codex_agents = db.recover_interrupted_codex_agents()
     if recovered_codex_agents:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
+    recovered_totp_setups = db.recover_interrupted_totp_setups()
+    if recovered_totp_setups:
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的 2FA 状态", recovered_totp_setups)
 
     # ----------------------------------------------------------
     # 页面
@@ -284,6 +376,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=500, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
         date_from = str(request.args.get("date_from", default="") or "").strip() or None
         date_to = str(request.args.get("date_to", default="") or "").strip() or None
@@ -295,11 +388,11 @@ def create_app(auth_code: str | None = None) -> Flask:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, q=q, date_from=date_from, date_to=date_to)
+            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, date_from=date_from, date_to=date_to)
             result["items"] = [_compact_account_for_list(r) for r in (result.get("items") or [])]
             result.update({"ok": True, "page": page, "page_size": page_size, "compact": True})
             return jsonify(result)
-        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, q=q, date_from=date_from, date_to=date_to))
+        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, date_from=date_from, date_to=date_to))
 
     @app.get("/api/accounts/plan-check-status")
     def api_account_plan_check_status():
@@ -307,17 +400,20 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=5000, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
+        date_from = str(request.args.get("date_from", default="") or "").strip() or None
+        date_to = str(request.args.get("date_to", default="") or "").strip() or None
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
         if page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, q=q)
+            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, date_from=date_from, date_to=date_to)
             snapshot.update({"page": page, "page_size": page_size})
         else:
-            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, q=q)
+            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, date_from=date_from, date_to=date_to)
         snapshot["queue"] = plan_check_service.queue_settings()
         return jsonify(snapshot)
 
@@ -458,6 +554,37 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not updated:
             return jsonify({"ok": False, "error": "账号不存在"}), 404
         return jsonify({"ok": True, "updated": True, "id": acc_id, "note": note})
+
+    @app.post("/api/accounts/<int:acc_id>/totp-setup")
+    def api_account_totp_setup(acc_id: int):
+        """为单个账号开启 2FA/TOTP，成功后自动把 secret 写回账号记录。"""
+        acc = db.get_account(acc_id)
+        if not acc:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        token = str(acc.get("access_token") or "").strip()
+        if not token:
+            return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
+        if bool(acc.get("totp_secret")):
+            return jsonify({"ok": False, "error": "该账号已经开启 2FA"}), 400
+
+        try:
+            from core import twofa_service
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"2FA 服务加载失败：{type(exc).__name__}: {exc}"}), 503
+
+        queued = twofa_service.enqueue_account_totp_setup(
+            account_id=acc_id,
+            email=str(acc.get("email") or ""),
+            access_token=token,
+            trigger="manual",
+            proxy=str(acc.get("proxy_used") or "") or None,
+        )
+        queued_payload = {k: v for k, v in queued.items() if k != "future"}
+        if queued.get("busy"):
+            return jsonify({"ok": False, **queued_payload}), 409
+        if not queued.get("accepted"):
+            return jsonify({"ok": False, **queued_payload}), 503
+        return jsonify({"ok": True, "started": True, **queued_payload}), 202
 
     @app.post("/api/accounts/note-bulk")
     def api_accounts_note_bulk():
@@ -873,9 +1000,8 @@ def create_app(auth_code: str | None = None) -> Flask:
         }), 202
 
     def _codex_agent_auth_for_account(acc: dict) -> tuple[str, str]:
-        """返回账号已生成的 Codex Agent auth.json 文本与下载文件名。"""
+        """从 SQLite 返回账号已生成的 Codex Agent auth.json 文本与下载文件名。"""
         import json as _json
-        from pathlib import Path as _Path
 
         email = str(acc.get("email") or "").strip()
         safe_email = "".join(ch if ch.isalnum() or ch in ("@", ".", "-", "_") else "_" for ch in (email or f"account-{acc.get('id')}"))
@@ -889,11 +1015,9 @@ def create_app(auth_code: str | None = None) -> Flask:
                 token_text = token_text + ("\n" if not token_text.endswith("\n") else "")
             return token_text, filename
 
-        auth_path = str(acc.get("codex_agent_auth_path") or "").strip()
-        if auth_path:
-            p = _Path(auth_path)
-            if p.exists() and p.is_file():
-                return p.read_text(encoding="utf-8"), p.name or filename
+        stored = db.get_codex_agent_credential(int(acc.get("id") or 0))
+        if stored:
+            return stored
 
         raise RuntimeError("该账号还没有生成 Codex Agent Token")
 
@@ -1289,26 +1413,20 @@ def create_app(auth_code: str | None = None) -> Flask:
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
-        fetch_limit = 1_000_000 if (paged or q) else limit
-        if source == "all":
-            rows = []
-            rows += _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
-            rows += _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
-            rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
-            rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
-        elif source == "generic_api":
-            rows = _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
-        elif source == "cloudflare_domain":
-            rows = _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
-        else:
-            rows = _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
-        if q:
-            rows = [r for r in rows if _matches_query(r, q)]
         if paged or page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
-            return jsonify(_paginate_items(rows, page=page, page_size=page_size))
-        return jsonify(rows[:limit])
+            offset = (page - 1) * page_size
+            result = db.list_email_pool_page(
+                source=source, status=status, q=q, limit=page_size, offset=offset
+            )
+            result.update({"ok": True, "page": page, "page_size": page_size})
+            return jsonify(result)
+        # 兼容旧接口仍返回数组，但查询本身也只从 SQLite 读取 limit 条。
+        result = db.list_email_pool_page(
+            source=source, status=status, q=q, limit=max(1, int(limit or 1)), offset=0
+        )
+        return jsonify(result["items"])
 
     @app.post("/api/outlook/import")
     def api_outlook_import():
@@ -1539,14 +1657,10 @@ def create_app(auth_code: str | None = None) -> Flask:
     # ----------------------------------------------------------
     @app.get("/api/codex")
     def api_codex_list():
-        rows = db.list_codex_accounts(
-            archived=str(request.args.get("archived", default="0") or "0").lower(),
-            date_from=str(request.args.get("date_from", default="") or "").strip() or None,
-            date_to=str(request.args.get("date_to", default="") or "").strip() or None,
-        )
         q = str(request.args.get("q", default="") or "").strip()
-        if q:
-            rows = [r for r in rows if _matches_query(r, q)]
+        archived = str(request.args.get("archived", default="0") or "0").lower()
+        date_from = str(request.args.get("date_from", default="") or "").strip() or None
+        date_to = str(request.args.get("date_to", default="") or "").strip() or None
         limit = request.args.get("limit", default=500, type=int)
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
         page_arg = request.args.get("page", default=None, type=int)
@@ -1554,13 +1668,29 @@ def create_app(auth_code: str | None = None) -> Flask:
         if paged or page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
-            result = _paginate_items(rows, page=page, page_size=page_size)
+            result = db.list_codex_accounts_page(
+                archived=archived,
+                date_from=date_from,
+                date_to=date_to,
+                q=q,
+                limit=page_size,
+                offset=(page - 1) * page_size,
+            )
+            result.update({"ok": True, "page": page, "page_size": page_size})
             result["accounts"] = result.pop("items")
             result["summary"] = db.codex_accounts_summary()
             return jsonify(result)
+        result = db.list_codex_accounts_page(
+            archived=archived,
+            date_from=date_from,
+            date_to=date_to,
+            q=q,
+            limit=max(1, int(limit or 1)),
+            offset=0,
+        )
         return jsonify({
             "summary": db.codex_accounts_summary(),
-            "accounts": rows[:limit],
+            "accounts": result["items"],
         })
 
     @app.post("/api/codex/archive")
@@ -1947,7 +2077,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         acc = db.get_account_by_email(email)
         if acc is None:
             return jsonify({"ok": False, "error": f"账号不存在: {email}"}), 404
-        if (acc.get("codex_status") or "") == "deactivated":
+        if (acc.get("live_check_status") or "") == "deactivated":
             return jsonify({"ok": False, "error": "账号已废号，不能补跑 Codex"}), 409
         if not _reserve_codex_retry(email):
             return jsonify({"ok": False, "error": "该账号正在补跑中，请稍候"}), 409
@@ -1999,7 +2129,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             if not email:
                 skipped.append({"id": acc_id, "reason": "邮箱为空"})
                 continue
-            if (acc.get("codex_status") or "") == "deactivated":
+            if (acc.get("live_check_status") or "") == "deactivated":
                 skipped.append({"id": acc_id, "email": email, "reason": "账号已废号"})
                 continue
             if not _reserve_codex_retry(email):
@@ -2076,19 +2206,24 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not email:
             return jsonify({"ok": False, "error": "email 为空"}), 400
         p = account_liveness.log_path(email)
-        if not p.exists():
-            return jsonify({"ok": True, "log": "", "running": live_check_service.is_checking(email)})
-        max_bytes = 80_000
-        size = p.stat().st_size
-        with p.open("rb") as f:
-            if size > max_bytes:
-                f.seek(size - max_bytes)
-            content = f.read().decode("utf-8", errors="replace")
-        return jsonify({
-            "ok": True,
-            "log": content,
-            "running": live_check_service.is_checking(email),
-        })
+        data = _read_log_tail(p, max_bytes=80_000, running_fn=lambda: live_check_service.is_checking(email))
+        return jsonify(data)
+
+    @app.get("/api/accounts/totp-setup-log")
+    def api_account_totp_setup_log():
+        """读取某邮箱最近一次 2FA 设置日志。?email=xxx"""
+        from core import twofa_service
+        email = (request.args.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "email 为空"}), 400
+        p = twofa_service.log_path(email)
+        data = _read_log_tail(p, max_bytes=80_000, running_fn=lambda: False)
+        try:
+            acc = db.get_account_by_email(email) or {}
+            data["running"] = bool(str(acc.get("totp_setup_status") or "") in {"queued", "running"}) or twofa_service.is_running(int(acc.get("id") or 0))
+        except Exception:
+            pass
+        return jsonify(data)
 
     # ----------------------------------------------------------
     # 注册任务
@@ -2099,21 +2234,27 @@ def create_app(auth_code: str | None = None) -> Flask:
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
-        fetch_limit = 1_000_000 if (paged or page_arg is not None or page_size_arg is not None) else limit
         from config import email as _email_cfg
         manual_otp_required = not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
-        rows = db.list_jobs(limit=fetch_limit)
-        for row in rows:
-            row["manual_otp_required"] = manual_otp_required
-            row.update(svc.get_retry_info(row))
         if paged or page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
-            result = _paginate_items(rows, page=page, page_size=page_size)
-            result["items"] = [_compact_job_for_list(r) for r in (result.get("items") or [])]
-            result["status_counts"] = _job_status_counts(rows)
+            result = db.list_jobs_page(
+                limit=page_size, offset=(page - 1) * page_size
+            )
+            rows = result.get("items") or []
+            for row in rows:
+                row["manual_otp_required"] = manual_otp_required
+                row.update(svc.get_retry_info(row))
+            result.update({"ok": True, "page": page, "page_size": page_size})
+            result["items"] = [_compact_job_for_list(r) for r in rows]
+            result["status_counts"] = db.job_status_counts()
             result["compact"] = True
             return jsonify(result)
+        rows = db.list_jobs(limit=max(1, int(limit or 1)))
+        for row in rows:
+            row["manual_otp_required"] = manual_otp_required
+            row.update(svc.get_retry_info(row))
         return jsonify(rows)
 
     @app.post("/api/jobs")
